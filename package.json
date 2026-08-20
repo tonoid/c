@@ -1,18 +1,40 @@
 {
   "name": "@tonoid/c",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pick a Claude Code account and launch it, with 5-hour and weekly usage at a glance",
-  "keywords": ["claude", "claude-code", "cli", "accounts", "usage", "switcher"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "cli",
+    "accounts",
+    "usage",
+    "switcher"
+  ],
   "license": "MIT",
   "author": "simo <simo@tonoid.com>",
   "homepage": "https://github.com/tonoid/c#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/tonoid/c.git" },
-  "bugs": { "url": "https://github.com/tonoid/c/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tonoid/c.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tonoid/c/issues"
+  },
   "type": "module",
-  "bin": { "c": "./c.mjs" },
+  "bin": {
+    "c": "./c.mjs"
+  },
   "exports": "./c.mjs",
-  "files": ["c.mjs"],
-  "engines": { "node": ">=18" },
-  "publishConfig": { "access": "public" },
-  "scripts": { "test": "node --test test/test.mjs" }
+  "files": [
+    "c.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/test.mjs"
+  }
 }
