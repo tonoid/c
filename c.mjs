@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 export const HOME = os.homedir()
@@ -37,21 +38,55 @@ let cachedServices
 export const keychainServices = (dump = () => sh('security', ['dump-keychain']) || '') =>
   (cachedServices ??= [...dump().matchAll(/"svce"<blob>="([^"]*)"/g)].map(m => m[1]).filter(s => /claude/i.test(s)))
 
-// Only the item name says which account it belongs to. Claude Code stores the
-// default one as "Claude Code-credentials" and puts the id of ~/.claude-<id>
-// in the name of the others.
-export function keychainService (id, names = keychainServices()) {
-  const hit = names.find(n => new RegExp(`(^|[^a-z0-9])${id.replace(/[^\w.-]/g, '')}([^a-z0-9]|$)`, 'i').test(n))
-  if (hit || id !== 'main') return hit || null
+// Only the item name says which account it belongs to, and Claude Code names it
+// after the config dir rather than the account: "Claude Code-credentials" for a
+// default ~/.claude, and that name with the first 8 hex of sha256(dir) appended
+// for every other CLAUDE_CONFIG_DIR. The hash is authoritative, so it is tried
+// first; the id-in-the-name match behind it keeps working for a build that
+// spells the item out, and the lone-item guess covers a renamed default.
+export const keychainSuffix = dir => createHash('sha256').update(dir).digest('hex').slice(0, 8)
+
+// The item names that name THIS dir: the hash, or the id spelled into the name
+// by a build that does that. Nothing here is a guess, which is what `remove`
+// needs before it deletes anything.
+export function ownKeychainService (dir, names = keychainServices()) {
+  const id = accountId(dir)
+  // The hash first: a login that was handed CLAUDE_CONFIG_DIR writes that name
+  // even for ~/.claude, whose unsuffixed name is otherwise its own.
+  const own = [`Claude Code-credentials-${keychainSuffix(dir)}`, ...(id === 'main' ? ['Claude Code-credentials'] : [])]
+  return own.find(n => names.includes(n)) ||
+    names.find(n => new RegExp(`(^|[^a-z0-9])${id.replace(/[^\w.-]/g, '')}([^a-z0-9]|$)`, 'i').test(n)) ||
+    null
+}
+
+export function keychainService (dir, names = keychainServices()) {
+  const own = ownKeychainService(dir, names)
+  if (own || accountId(dir) !== 'main') return own
+  // Reading tolerates a guess the default dir cannot spell out for itself.
   return names.find(n => /^claude code-credentials$/i.test(n)) || (names.length === 1 ? names[0] : null)
 }
 
 export function readCreds (dir) {
   const file = readJson(path.join(dir, '.credentials.json'))
   if (file || !MAC) return file
-  const svc = keychainService(accountId(dir))
+  const svc = keychainService(dir)
   const raw = svc && sh('security', ['find-generic-password', '-s', svc, '-w'])
   return raw ? parse(raw.trim()) : null
+}
+
+// Deleting a login is the one destructive thing here, so it takes an account
+// discover() produced and refuses anything that is not a ~/.claude-<id> dir.
+// A keychain item is only deleted when it names this dir: the read-side guess
+// could belong to another account, and logging that one out is not recoverable.
+export function removeAccount (acc, db, { file = DB, keychain = MAC } = {}) {
+  if (!path.basename(acc.dir).startsWith('.claude-')) throw new Error(`refusing to remove ${acc.dir}`)
+  const svc = keychain ? ownKeychainService(acc.dir) : null
+  fs.rmSync(acc.dir, { recursive: true, force: true })
+  if (svc) sh('security', ['delete-generic-password', '-s', svc])
+  db.order = db.order.filter(id => id !== acc.id)
+  delete db.usage[acc.id]
+  saveDb(db, file)
+  return svc
 }
 
 // ---------- db ----------
@@ -98,7 +133,7 @@ export function loggedIn (dir, home = HOME) {
   if (fs.existsSync(path.join(dir, '.credentials.json'))) return true
   const acc = oauthAccount(dir, home)
   if (acc.accountUuid || acc.emailAddress) return true
-  return MAC && !!keychainService(accountId(dir))
+  return MAC && !!keychainService(dir)
 }
 
 export function discover (home = HOME, order = []) {
@@ -258,6 +293,31 @@ function menu (accounts, db) {
   })
 }
 
+// ---------- prompting ----------
+// One keypress, no readline: raw mode is already how the menu reads stdin, so
+// this keeps the file dependency-free. Raw mode does not echo, hence the write.
+// Trimmed, because the keypress is not always the bare letter: a pty forwarding
+// a piped answer appends CR, and comparing the raw chunk reads that as a no.
+export const isYes = key => String(key).trim().toLowerCase() === 'y'
+
+const confirm = question => new Promise(resolve => {
+  process.stdout.write(question)
+  process.stdin.setRawMode?.(true)
+  process.stdin.resume()
+  process.stdin.setEncoding('utf8')
+  process.stdin.once('data', key => {
+    process.stdin.setRawMode?.(false)
+    process.stdin.pause()
+    process.stdout.write(`${key.trim()}\n`)
+    resolve(isYes(key))
+  })
+})
+
+const findAccount = (accounts, want) => {
+  const w = String(want ?? '').toLowerCase()
+  return accounts.find(a => a.id.toLowerCase() === w || a.name.toLowerCase() === w) || null
+}
+
 // ---------- cli ----------
 const pad = s => s.padEnd(20 + CMD.length)
 const HELP = `${CMD}: one command for several Claude Code accounts
@@ -267,6 +327,7 @@ const HELP = `${CMD}: one command for several Claude Code accounts
   ${pad(CMD + ' -a <id> [args]')}launch a specific account
   ${pad(CMD + ' status')}show the usage table and exit
   ${pad(CMD + ' add <id>')}log in to a new account in ~/.claude-<id>
+  ${pad(CMD + ' remove <id>')}delete ~/.claude-<id> and the keychain item it owns
   ${pad(CMD + ' yolo [on|off]')}toggle the --dangerously-skip-permissions default
   ${pad(CMD + ' worktree [on|off]')}toggle the --worktree default (a git worktree per session)
   ${CMD} version
@@ -316,9 +377,28 @@ async function main (argv) {
     db[k] = argv[1] ? argv[1] === 'on' : !db[k]
     saveDb(db)
     console.log(`${k} ${db[k] ? `on (${FLAGS[k]})` : 'off'}`)
+  } else if (argv[0] === 'remove' || argv[0] === 'rm') {
+    const yes = argv.includes('--yes') || argv.includes('-y')
+    const id = argv.slice(1).find(a => a !== '--yes' && a !== '-y')
+    if (!id) { console.error(`usage: ${CMD} remove <id>   e.g. ${CMD} remove work`); process.exit(1) }
+    const acc = findAccount(accounts, id)
+    if (!acc) { console.error(`${CMD}: no account "${id}" (have: ${accounts.map(a => a.id).join(', ')})`); process.exit(1) }
+    // ~/.claude is not just a login: settings, projects and history live there.
+    if (acc.id === 'main') {
+      console.error(`${CMD}: won't delete ${acc.dir.replace(HOME, '~')}, it holds your settings, projects and history and not only a login. Log out from inside claude instead.`)
+      process.exit(1)
+    }
+    const svc = MAC ? ownKeychainService(acc.dir) : null
+    console.log(`\n  ${C.bold}${acc.name}${C.off} ${C.dim}(${acc.id})${C.off}\n  ${acc.dir.replace(HOME, '~')}`)
+    console.log(svc ? `  keychain item ${svc}` : MAC ? `  ${C.yel}no keychain item names this dir, anything it left stays${C.off}` : '')
+    if (!yes) {
+      if (!process.stdin.isTTY) { console.error(`${CMD}: not a terminal, pass --yes to remove ${acc.id}`); process.exit(1) }
+      if (!await confirm(`  delete it? [y/N] `)) { console.log('nothing removed'); return }
+    }
+    removeAccount(acc, db)
+    console.log(`removed ${acc.id}`)
   } else if (argv[0] === '-a' || argv[0] === '--account') {
-    const want = String(argv[1] ?? '').toLowerCase()
-    const acc = accounts.find(a => a.id.toLowerCase() === want || a.name.toLowerCase() === want)
+    const acc = findAccount(accounts, argv[1])
     if (!acc) { console.error(`${CMD}: no account "${argv[1]}" (have: ${accounts.map(a => a.id).join(', ')})`); process.exit(1) }
     launch(acc, argv.slice(2), db)
   } else if (argv.length) {

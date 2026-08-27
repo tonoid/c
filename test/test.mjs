@@ -7,7 +7,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
-import { until, planLabel, sortByRecent, discover, table, loadDb, fetchUsage, defaultFlags, keychainService } from '../c.mjs'
+import { until, planLabel, sortByRecent, discover, table, loadDb, fetchUsage, defaultFlags, keychainService, keychainSuffix, ownKeychainService, removeAccount, isYes } from '../c.mjs'
 
 const CLI = fileURLToPath(new URL('../c.mjs', import.meta.url))
 const NOW = Date.parse('2026-08-19T12:00:00Z')
@@ -94,10 +94,87 @@ test('discover keeps an account whose token lives outside the config dir', () =>
 
 test('keychainService matches an item to the config dir it belongs to', () => {
   const names = ['Claude Code-credentials', 'Claude Code-credentials-work']
-  assert.equal(keychainService('work', names), 'Claude Code-credentials-work')
-  assert.equal(keychainService('main', names), 'Claude Code-credentials', 'the unnamed item is the default dir')
-  assert.equal(keychainService('team', names), null, 'no guessing for an account with no item')
-  assert.equal(keychainService('main', ['Claude Code']), 'Claude Code', 'a lone claude item is the default dir whatever it is called')
+  assert.equal(keychainService('/home/u/.claude-work', names), 'Claude Code-credentials-work')
+  assert.equal(keychainService('/home/u/.claude', names), 'Claude Code-credentials', 'the unnamed item is the default dir')
+  assert.equal(keychainService('/home/u/.claude-team', names), null, 'no guessing for an account with no item')
+  assert.equal(keychainService('/home/u/.claude', ['Claude Code']), 'Claude Code', 'a lone claude item is the default dir whatever it is called')
+})
+
+test('keychainService prefers the hash of the config dir over the account id', () => {
+  // What Claude Code actually writes: the item is named for the dir it was told
+  // to use, so the id never appears and only the hash finds it.
+  const dir = '/home/u/.claude-work'
+  const hashed = `Claude Code-credentials-${keychainSuffix(dir)}`
+  assert.equal(keychainSuffix(dir).length, 8)
+  assert.equal(keychainService(dir, [hashed]), hashed, 'an id-less item still resolves')
+  assert.equal(
+    keychainService(dir, ['Claude Code-credentials-work', hashed]),
+    hashed,
+    'the hash wins over a same-named item belonging to another dir'
+  )
+  assert.notEqual(keychainSuffix(dir), keychainSuffix('/other/.claude-work'), 'the same id under a different home hashes apart')
+})
+
+test('ownKeychainService never falls back to an item that names another dir', () => {
+  // keychainService may guess for the default dir, because reading the wrong
+  // token only misreports usage. remove deletes, so it gets the strict one.
+  const dir = '/home/u/.claude'
+  assert.equal(keychainService(dir, ['Claude Code']), 'Claude Code', 'reading takes the lone item')
+  assert.equal(ownKeychainService(dir, ['Claude Code']), null, 'deleting does not')
+  assert.equal(ownKeychainService(dir, ['Claude Code-credentials']), 'Claude Code-credentials', 'the default name is still its own')
+})
+
+test('isYes reads a keypress that carries a line ending', () => {
+  for (const yes of ['y', 'Y', 'y\r', 'y\n', ' y ']) assert.equal(isYes(yes), true, JSON.stringify(yes))
+  for (const no of ['n', '\r', '', 'yes please', 'q']) assert.equal(isYes(no), false, JSON.stringify(no))
+})
+
+test('removeAccount deletes the dir and forgets the account', () => {
+  const home = fakeHome({ '.claude-work': { displayName: 'Work' }, '.claude-keep': { displayName: 'Keep' } })
+  const file = path.join(home, 'db.json')
+  const db = { order: ['work', 'keep'], usage: { work: { at: 1 }, keep: { at: 2 } } }
+  const [work] = discover(home, []).filter(a => a.id === 'work')
+
+  removeAccount(work, db, { file, keychain: false })
+
+  assert.equal(fs.existsSync(work.dir), false, 'the config dir is gone')
+  assert.deepEqual(discover(home, []).map(a => a.id), ['keep'], 'and it stops being discovered')
+  assert.deepEqual(db.order, ['keep'], 'the recency list drops it')
+  assert.deepEqual(Object.keys(db.usage), ['keep'], 'so does the usage cache')
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).order, ['keep'], 'and the db on disk is written')
+})
+
+test('removeAccount refuses a directory that is not an account', () => {
+  const home = fakeHome({ '.claude-work': { displayName: 'Work' } })
+  const notAnAccount = { id: 'x', dir: path.join(home, '.ssh') }
+  fs.mkdirSync(notAnAccount.dir, { recursive: true })
+  assert.throws(() => removeAccount(notAnAccount, loadDb(path.join(home, 'db.json')), { file: path.join(home, 'db.json'), keychain: false }), /refusing to remove/)
+  assert.equal(fs.existsSync(notAnAccount.dir), true, 'and leaves it alone')
+})
+
+test('remove will not delete the default ~/.claude', () => {
+  const home = fakeHome({ '.claude': { displayName: 'Main' } })
+  const r = cli(['remove', 'main'], { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config') })
+  assert.equal(r.status, 1)
+  assert.match(r.out, /settings, projects and history/)
+  assert.equal(fs.existsSync(path.join(home, '.claude')), true)
+})
+
+test('remove needs a terminal or an explicit --yes', () => {
+  const home = fakeHome({ '.claude-work': { displayName: 'Work' } })
+  const r = cli(['remove', 'work'], { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config') })
+  assert.equal(r.status, 1, 'a piped run must not delete on its own')
+  assert.match(r.out, /pass --yes/)
+  assert.equal(fs.existsSync(path.join(home, '.claude-work')), true, 'the account survives the refusal')
+})
+
+test('remove --yes deletes without asking', () => {
+  const home = fakeHome({ '.claude-work': { displayName: 'Work' }, '.claude-keep': { displayName: 'Keep' } })
+  const r = cli(['remove', 'work', '--yes'], { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config') })
+  assert.equal(r.status, 0, r.out)
+  assert.match(r.out, /removed work/)
+  assert.equal(fs.existsSync(path.join(home, '.claude-work')), false)
+  assert.equal(fs.existsSync(path.join(home, '.claude-keep')), true, 'only the named account goes')
 })
 
 test('discover labels an account with no profile yet', () => {
@@ -120,12 +197,15 @@ test('table aligns every column, including a row whose usage failed', () => {
 
 test('table shows a reset per window, not just the 5h one', () => {
   const accounts = [{ id: 'a', name: 'personal', plan: 'max 20x' }]
-  const usage = { a: { five: { pct: 9, resets: '2026-08-19T14:00:00Z' }, week: { pct: 91, resets: '2026-08-26T15:00:00Z' } } }
+  // table() reads the real clock, so the fixture has to stay in the future or
+  // both windows render as "now" and the two columns stop being tellable apart.
+  const ahead = ms => new Date(Date.now() + ms).toISOString()
+  const usage = { a: { five: { pct: 9, resets: ahead(2 * 3600e3) }, week: { pct: 91, resets: ahead(5 * 86400e3) } } }
   const [head, row] = table(accounts, usage).split('\n')
   assert.equal(head.match(/resets/g).length, 2, 'one resets header per window')
   // Both reset headers sit at or left of their value, and in window order.
-  const fiveAt = row.indexOf(until('2026-08-19T14:00:00Z'))
-  const weekAt = row.indexOf(until('2026-08-26T15:00:00Z'))
+  const fiveAt = row.indexOf(until(usage.a.five.resets))
+  const weekAt = row.indexOf(until(usage.a.week.resets))
   assert.ok(fiveAt > row.indexOf('9%') && fiveAt < row.indexOf('91%'), '5h reset sits between the two percentages')
   assert.ok(weekAt > row.indexOf('91%'), 'week reset sits after the week percentage')
 })
