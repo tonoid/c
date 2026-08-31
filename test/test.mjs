@@ -7,7 +7,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
-import { until, planLabel, sortByRecent, discover, table, loadDb, fetchUsage, defaultFlags, keychainService, keychainSuffix, ownKeychainService, removeAccount, isYes } from '../c.mjs'
+import { until, planLabel, sortByRecent, discover, table, loadDb, fetchUsage, mergeUsage, usageFrom, readCache, writeCache, cachePath, defaultFlags, keychainService, keychainSuffix, ownKeychainService, removeAccount, isYes } from '../c.mjs'
 
 const CLI = fileURLToPath(new URL('../c.mjs', import.meta.url))
 const NOW = Date.parse('2026-08-19T12:00:00Z')
@@ -296,4 +296,47 @@ test('a home with no logged-in dirs points at the fix instead of crashing', () =
   const r = cli(['status'], { HOME: home, XDG_CONFIG_HOME: path.join(home, '.config') })
   assert.equal(r.status, 1)
   assert.match(r.out, /c add <id>/)
+})
+
+test('a failed refresh keeps the last good numbers, flagged stale', () => {
+  const good = { at: 1, five: { pct: 9, resets: 'x' }, week: { pct: 30, resets: 'y' } }
+  const limited = { at: 2, error: 'rate limited' }
+
+  assert.deepEqual(mergeUsage(good, limited), { ...good, at: 2, stale: 'rate limited' })
+  assert.deepEqual(mergeUsage(undefined, limited), limited)        // nothing to keep
+  assert.deepEqual(mergeUsage({ at: 1, error: 'logged out' }, limited), limited)
+  assert.deepEqual(mergeUsage(good, { at: 3, five: null }), { at: 3, five: null })
+})
+
+test('usage is read from whatever the endpoint said, not a shape we invented', () => {
+  const body = { five_hour: { utilization: 3.4, resets_at: 'a' }, seven_day: { utilization: 39, resets_at: 'b' } }
+  assert.deepEqual(usageFrom({ at: 7, status: 200, body }), {
+    at: 7, five: { pct: 3, resets: 'a' }, week: { pct: 39, resets: 'b' }
+  })
+  assert.equal(usageFrom({ at: 7, status: 429 }).error, 'rate limited')
+  assert.equal(usageFrom({ at: 7, status: 401 }).error, 'logged out')
+  assert.equal(usageFrom({ at: 7, status: 500 }).error, 'http 500')
+  // A window that has never started is absent, not zero.
+  assert.deepEqual(usageFrom({ at: 7, status: 200, body: {} }), { at: 7, five: null, week: null })
+})
+
+test('the usage cache lives in the account dir and expires, 429s for longer', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'c-cache-'))
+  const at = Date.now()
+
+  assert.equal(readCache(dir, at), null, 'no cache yet')
+
+  writeCache(dir, { at, status: 200, body: { five_hour: { utilization: 3 } } })
+  assert.equal(cachePath(dir), path.join(dir, 'cache', 'usage.json'), 'beside the credentials it was read with')
+  assert.equal(readCache(dir, at + 30_000)?.status, 200, 'fresh enough to reuse')
+  assert.equal(readCache(dir, at + 90_000), null, 'a minute old, ask again')
+
+  writeCache(dir, { at, status: 429 })
+  assert.equal(readCache(dir, at + 90_000)?.status, 429, 'a 429 holds us off past the normal TTL')
+  assert.equal(readCache(dir, at + 6 * 60_000), null, 'but not forever')
+
+  fs.writeFileSync(cachePath(dir), '{ torn')
+  assert.equal(readCache(dir, at), null, 'a half-written cache is a miss, not a crash')
+
+  fs.rmSync(dir, { recursive: true, force: true })
 })

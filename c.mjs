@@ -15,6 +15,10 @@ const CMD = 'c'
 const CONFIG_HOME = process.env.XDG_CONFIG_HOME || path.join(HOME, '.config')
 export const DB = path.join(CONFIG_HOME, CMD, 'db.json')
 const TTL = 60_000 // usage cache lifetime
+// The usage endpoint allows about 5 calls per token per minute, and a running
+// claude spends them on its own status line. After a 429, wait instead of
+// asking again on the next `c`.
+const BACKOFF = 5 * 60_000
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 
 const C = process.stdout.isTTY
@@ -162,28 +166,84 @@ export function sortByRecent (accounts, order) {
 }
 
 // ---------- usage ----------
+// One reading per account, shared with anything else that polls this endpoint
+// for the same account (agent-loop, for one). It lives in the account's own
+// config dir beside the credentials it was read with, so it is thrown away
+// with the account and never outlives it. What we store is the endpoint's
+// answer verbatim: readers want different parts of it (`five_hour` here,
+// `limits[]` in agent-loop) and a raw body costs nobody a negotiation.
+export const cachePath = dir => path.join(dir, 'cache', 'usage.json')
+
+export function readCache (dir, now = Date.now()) {
+  const c = readJson(cachePath(dir))
+  if (!c?.at) return null
+  return now - c.at < (c.status === 429 ? BACKOFF : TTL) ? c : null
+}
+
+export function writeCache (dir, entry) {
+  const p = cachePath(dir)
+  // Unique per writer: two processes reading the same account in the same
+  // second must not rename over each other's half-written file.
+  const tmp = `${p}.${process.pid}.tmp`
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 })
+    fs.renameSync(tmp, p)
+  } catch {
+    // A cache we cannot write is a slow day, not a failure.
+    try { fs.unlinkSync(tmp) } catch {}
+  }
+}
+
+// A 429 here is the metering endpoint's own burst budget (about 5 calls per
+// token per minute), not the account being out of quota. Quota exhaustion
+// arrives as a 200 with the windows at 100%.
+export function usageFrom ({ at, status, body }) {
+  if (status === 401) return { at, error: 'logged out' }
+  if (status === 429) return { at, error: 'rate limited' }
+  if (status !== 200) return { at, error: `http ${status}` }
+  const slice = w => w ? { pct: Math.round(w.utilization ?? 0), resets: w.resets_at } : null
+  return { at, five: slice(body?.five_hour), week: slice(body?.seven_day) }
+}
+
 export async function fetchUsage (dir, now = Date.now()) {
   const token = readCreds(dir)?.claudeAiOauth?.accessToken
   if (!token) return { at: now, error: 'no token' }
+
+  const hit = readCache(dir, now)
+  if (hit) return usageFrom(hit)
+
+  let entry
   try {
     const r = await fetch(USAGE_URL, {
       headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
       signal: AbortSignal.timeout(8000)
     })
-    if (!r.ok) return { at: now, error: r.status === 401 ? 'logged out' : `http ${r.status}` }
-    const j = await r.json()
-    const slice = w => w ? { pct: Math.round(w.utilization ?? 0), resets: w.resets_at } : null
-    return { at: now, five: slice(j.five_hour), week: slice(j.seven_day) }
+    entry = { at: now, status: r.status, body: r.status === 200 ? await r.json() : null }
   } catch (e) {
+    // Nothing to share: a timeout is this box's problem, not the endpoint's.
     return { at: now, error: e.name === 'TimeoutError' ? 'timeout' : 'offline' }
   }
+  // Never cache a 401: it is a fact about this access token, not about the
+  // account, and agent-loop refreshes and retries the moment it sees one.
+  if (entry.status !== 401) writeCache(dir, entry)
+  return usageFrom(entry)
 }
 
+// A failed refresh keeps the last numbers we did get, flagged stale, so one 429
+// does not blank a row that was fine a minute ago.
+export function mergeUsage (prev, next) {
+  if (!next.error || !prev || prev.error) return next
+  return { ...prev, at: next.at, stale: next.error }
+}
+
+const expired = u => Date.now() - u.at > (u.error === 'rate limited' || u.stale === 'rate limited' ? BACKOFF : TTL)
+
 async function refresh (accounts, db, force = false) {
-  const stale = accounts.filter(a => force || !db.usage[a.id] || Date.now() - db.usage[a.id].at > TTL)
+  const stale = accounts.filter(a => force || !db.usage[a.id] || expired(db.usage[a.id]))
   if (!stale.length) return
   const got = await Promise.all(stale.map(a => fetchUsage(a.dir)))
-  stale.forEach((a, i) => { db.usage[a.id] = got[i] })
+  stale.forEach((a, i) => { db.usage[a.id] = mergeUsage(db.usage[a.id], got[i]) })
   saveDb(db)
 }
 
@@ -219,7 +279,7 @@ export function table (accounts, usage = {}, { selectable = false, cursor = 0 } 
     const num = selectable ? `${C.dim}${i + 1}${C.off}` : ' '
     const right = u.error
       ? `${C.red}${u.error}${C.off}`
-      : `${pct(u.five)}  ${resets(u.five)}   ${pct(u.week)}  ${resets(u.week)}`
+      : `${pct(u.five)}  ${resets(u.five)}   ${pct(u.week)}  ${resets(u.week)}${u.stale ? ` ${C.dim}~${C.off}` : ''}`
     rows.push(`${mark}${num} ${C.bold}${a.name.padEnd(w)}${C.off}  ${C.dim}${(a.plan || '?').padEnd(p)}${C.off}  ${right}`.trimEnd())
   })
   return rows.join('\n')
